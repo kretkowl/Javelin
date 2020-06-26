@@ -24,19 +24,36 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 import java.util.TreeSet;
 import java.util.Vector;
+import java.util.WeakHashMap;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+
+import org.jline.reader.LineReader;
+import org.jline.reader.LineReaderBuilder;
+import org.jline.terminal.Terminal;
+import org.jline.terminal.TerminalBuilder;
 
 public final class Core {
-	public static final String VERSION = "0.13.8";
+	public static final String VERSION = "0.13.8.KRETKOWL";
 
-	// no instance
-	private Core() {
-		
+	public Core(Reader r, String ... stdlibWithNames) {
+	    this(new BufferedReader(r), new Environment(), new HashMap<String, UserFn>());
+	    init(stdlibWithNames);
 	}
 	
-	static BufferedReader defaultReader = new BufferedReader(new InputStreamReader(System.in));
+	private Core(BufferedReader r, Environment globalEnv, Map<String, UserFn> macros) {
+	    this.defaultReader = r;
+	    this.globalEnv = globalEnv;
+	    this.macros = macros;
+	}
+	
+	private final BufferedReader defaultReader;
 	static final Symbol sym_set_e = new Symbol("set!");
 	static final Symbol sym_def = new Symbol("def");
 	static final Symbol sym_and = new Symbol("and");
@@ -60,15 +77,49 @@ public final class Core {
 	static final Symbol sym_catch = new Symbol("catch");
 	static final Symbol sym_finally = new Symbol("finally");
 	static final Symbol sym_defmacro = new Symbol("defmacro");
+	static final Symbol sym_env = new Symbol("env");
 
-	static Environment globalEnv = new Environment(); // variables. compile-time
-	static ArrayList<String> imports = new ArrayList<String>();
-	static HashMap<String, UserFn> macros = new HashMap<>();
-	static HashMap<String, Class<?>> getClassCache = new HashMap<>();
+	private final Environment globalEnv; // variables. compile-time
+	private final Map<String, UserFn> macros;
+	private final Map<Object, Meta> meta = new WeakHashMap<>();
 	
 	public static Object testField;
-	
-	static {
+
+	public static String DEFAULTS =                   
+	        "(import java.lang)\n" +
+            "(defmacro defn (name & body) `(def ~name (fn ~@body)))\n" +
+            "(defmacro when (cond & body) `(if ~cond (do ~@body)))\n" +
+            "(defn nil? (x) (= nil x))\n" +
+            "(defmacro while (test & body) `(loop () (when ~test ~@body (recur))))\n" +
+            "(def gensym\n"+
+            "  (let (gs-counter 0)\n" +
+            "    (fn ()\n" +
+            "      (symbol (str \"G__\" (set! gs-counter (+ gs-counter 1)))))))\n" +
+            "(defmacro dotimes (binding & body)\n" +
+            "  (let (g (gensym), var (binding 0), limit (binding 1))\n" +
+            "    `(let (~g ~limit) (loop (~var 0) (when (< ~var ~g) ~@body (recur (+ ~var 1)))))))\n" +
+            "(defn load-file (file) (load-string (slurp file)))\n" +
+            "(defn range (& args)\n" + 
+            "  (let (size (. args size))\n" +
+            "    (if (== 0 size) (range 0 (/ 1 0) 1)\n" +
+            "      (if (== 1 size) (range 0 (args 0) 1)\n" +
+            "        (if (== 2 size) (range (args 0) (args 1) 1)\n" +
+            "          (let (start (args 0)\n" +
+            "                end (args 1)\n" +
+            "                step (args 2))\n" +
+            "            (reify java.lang.Iterable\n" +
+            "              (iterator (this)\n" +
+            "                (let (x start)\n" +
+            "                  (reify java.util.Iterator\n" +
+            "                    (hasNext (this)\n" +
+            "                      (< x end))\n" +
+            "                    (next (this)\n" +
+            "                      (let (cur x)\n" +
+            "                        (set! x (+ x step))\n" +
+            "                        cur)))))\n" +
+            "              (toString (this) (str \"(range \" start \" \" end \" \" step \")\")))))))))\n";
+
+	private void init(String ... stdlibWithNames) {
 		set("+", new Builtin._plus());
 		set("-", new Builtin._minus());
 		set("*", new Builtin._star());
@@ -83,9 +134,19 @@ public final class Core {
 		set("<=", new Builtin._lt_eq());
 		set(">=", new Builtin._gt_eq());
 		set("not", new Builtin.not());
-		set("read-string", new Builtin.read_string());
+		set("read-string", new Fn() {
+		      @Override
+		        public Object invoke(List<Object> args) throws Throwable {
+		            return parse(new StringReader((String) args.get(0)), new ParseContext("<anonymous block>"));
+		        }
+		});
 		set("type", new Builtin.type());
-		set("eval", new Builtin.eval());
+		set("eval", new Fn() {
+		      @Override
+		        public Object invoke(List<Object> args) throws Throwable {
+		            return macroexpandEval(args.get(0), Core.this.globalEnv);
+		        }
+		});
 		set("list", new Builtin.list());
 		set("apply", new Builtin.apply());
 		set("fold", new Builtin.fold());
@@ -100,33 +161,39 @@ public final class Core {
 		set("spit", new Builtin.spit());
 		set("str", new Builtin.str());
 		set("symbol", new Builtin.symbol());
-		set("macroexpand", new Builtin.macroexpand());
-		set("read", new Builtin.read());
-		set("load-string", new Builtin.load_string());
+		set("macroexpand", new Fn() {
+		      @Override
+		        public Object invoke(List<Object> args) throws Throwable {
+		            return macroexpand(args.get(0));
+		        }
+		});
+		set("read", new Fn() {
+		    @Override
+	        public Object invoke(List<Object> args) throws Throwable {
+		        ParseContext pc = new ParseContext("<read block>");
+	            switch (args.size()) {
+	            case 0: return parse(Core.this.defaultReader, pc);
+	            case 1: return parse((Reader) args.get(0), pc);
+	            default: throw new IllegalArgumentException();
+	            }
+	        }
+		});
+		set("load-string", new Fn() {
+		      @Override
+		        public Object invoke(List<Object> args) throws Throwable {
+		            switch (args.size()) {          
+		            case 1: return load_string((String) args.get(0), "<anonymous block>");
+		            default: throw new IllegalArgumentException();
+		            }
+		        }
+		});
 		set("nth", new Builtin.nth());
 		set("instance?", new Builtin.instance_q());
 		
-		try {
-			load_string(
-					"(import java.lang)\n" +
-					"(defmacro defn (name & body) `(def ~name (fn ~@body)))\n" +
-					"(defmacro when (cond & body) `(if ~cond (do ~@body)))\n" +
-					"(defn nil? (x) (= nil x))\n" +
-					"(defmacro while (test & body) `(loop () (when ~test ~@body (recur))))\n" +
-					"(def gensym\n"+
-					"  (let (gs-counter 0)\n" +
-					"    (fn ()\n" +
-					"      (symbol (str \"G__\" (set! gs-counter (+ gs-counter 1)))))))\n" +
-					"(defmacro dotimes (binding & body)\n" +
-					"  (let (g (gensym), var (binding 0), limit (binding 1))\n" +
-					"    `(let (~g ~limit) (loop (~var 0) (when (< ~var ~g) ~@body (recur (+ ~var 1)))))))\n" +
-					"(defn load-file (file) (load-string (slurp file)))\n" +
-					"(defn range (& args)\n  (let (size (. args size))\n    (if (== 0 size) (range 0 (/ 1 0) 1)\n      (if (== 1 size) (range 0 (args 0) 1)\n        (if (== 2 size) (range (args 0) (args 1) 1)\n          (let (start (args 0)\n                end (args 1)\n                step (args 2))\n            (reify java.lang.Iterable\n              (iterator (this)\n                (let (x start)\n                  (reify java.util.Iterator\n                    (hasNext (this)\n                      (< x end))\n                    (next (this)\n                      (let (cur x)\n                        (set! x (+ x step))\n                        cur)))))\n              (toString (this) (str \"(range \" start \" \" end \" \" step \")\")))))))))\n"
-					);			
-		} catch (Throwable e) {
-			// TODO Auto-generated catch block
-			e.printStackTrace();
-		}
+		
+	    AtomicInteger i = new AtomicInteger(0);
+	    Arrays.stream(stdlibWithNames).collect(Collectors.groupingBy(s -> i.getAndIncrement()/2))
+	    .values().forEach(entry -> {try { load_string(entry.get(1), entry.get(0)); } catch (Throwable t) { t.printStackTrace(); }});
 	}
 
 	static int intValue(Object value) {
@@ -158,6 +225,8 @@ public final class Core {
 			return false;
 		if (value instanceof Boolean)
 			return (Boolean) value;
+		if (value instanceof List)
+		    return ((List) value).size() > 0;
 		else
 			return true;
 	}
@@ -179,7 +248,7 @@ public final class Core {
 			return value.getClass();
 	}
 
-	static String toReadableString(Object value) {
+	static public String toReadableString(Object value) {
 		if (value == null) return "nil";
 		else if (value instanceof String) return "\"" + escape((String) value) + "\"";
 		else if (value instanceof Pattern) return "#\"" + escape(((Pattern) value).pattern()) + "\"";
@@ -202,6 +271,10 @@ public final class Core {
 			sb.append(closeParen);
 			return sb.toString();
 		}
+		else if (value instanceof Map) {
+		    Map<?,?> map = (Map<?,?>) value;
+		    return map.entrySet().stream().map(e -> toReadableString(e.getKey()) + " " + toReadableString(e.getValue())).collect(Collectors.joining(", "));
+		}
 		else if (value instanceof Class<?>) return ((Class<?>) value).getName();
 		else return value.toString();
 	}
@@ -216,6 +289,7 @@ public final class Core {
 			case '\n': sb.append("\\n"); break;
 			case '\r': sb.append("\\r"); break;
 			case '\t': sb.append("\\t"); break;
+			case '"': sb.append("\\\""); break;
 			default: sb.append(c); break;
 			}
 		}
@@ -239,6 +313,8 @@ public final class Core {
 				return ((List<?>) func).get(Core.intValue(args.get(0)));
 			} else if (func.getClass().isArray()) {
 				return Array.get(func, Core.intValue(args.get(0)));
+			} else if (func instanceof Map<?,?>) {
+			    return ((Map<?,?>) func).get(args.get(0));
 			}
 			else {
 				System.err.println("Unknown function: [" + func.toString() + "]");
@@ -254,7 +330,7 @@ public final class Core {
 		System.out.println();
 	}
 
-	public static void printLogo() {
+	public void printLogo() {
 		System.out.println("Javelin " + VERSION);
 		System.out.println("Special forms:");
 		ArrayList<String> fields = new ArrayList<String>();
@@ -281,7 +357,7 @@ public final class Core {
 		printCollection(macros.keySet());
 	}
 
-	static Object macroexpand(Object n) throws Throwable {
+	Object macroexpand(Object n) throws Throwable {
 		if (n instanceof ArrayList) {
 			List<Object> expr = Core.listValue(n);
 			if (expr.size() == 0) return n;
@@ -370,7 +446,11 @@ public final class Core {
 		return n;
 	}
 
-	static Object eval(Object n, Environment env) throws Throwable {
+	private String formatSourceLocation(Object value) {
+	    return getMeta(value).map(m -> m.sourceFile() +  " at line " + m.sourceLine()).orElse("unknown location");
+	}
+	
+	Object eval(Object n, Environment env) throws Throwable {
 		if (n instanceof Symbol) {
 			Object r = env.get(((Symbol) n).code);
 			return r;
@@ -391,9 +471,13 @@ public final class Core {
 				if (code == sym_set_e.code) { // (set! SYMBOL-OR-FIELD VALUE) ; set the SYMBOL-OR-FIELD's value
 					Object dest = expr.get(1);
 					if (dest instanceof Symbol) {
-						Object value = eval(expr.get(2), env);
-						env.set(((Symbol) dest).code, value);
-						return value;
+					    try {
+					        Object value = eval(expr.get(2), env);
+					        env.set(((Symbol) dest).code, value);
+					        return value;
+					    } catch (Exception e) {
+					        throw new RuntimeException("error while setting variable " + dest.toString() + ": " + e.getMessage() + " " + formatSourceLocation(expr), e);
+					    }
 					} else { // field
 						// Java interoperability
 						// (set! (. CLASS-OR-OBJECT -FIELD) VALUE) ; set Java field
@@ -424,38 +508,73 @@ public final class Core {
 				}
 				else if (code == sym_def.code) { // (def SYMBOL VALUE ...) ; set in the global
 							// environment
-					Object ret = null;
-					int len = expr.size();
-					for (int i = 1; i < len; i += 2) {
-						Object value = eval(expr.get(i + 1), env);
-						ret = globalEnv.def(((Symbol) expr.get(i)).code, value);
-					}
-					return ret;
+				    Symbol name=null;
+				    try {
+    					Object ret = null;
+    					int len = expr.size();
+    					for (int i = 1; i < len; i += 2) {
+    					    name = null;
+    					    name = (Symbol) expr.get(i);
+    						Object value = eval(expr.get(i + 1), env);
+    						meta.computeIfAbsent(value, __-> new Meta()).name(name.toString());
+    						ret = globalEnv.def(name.code, value);
+    					}
+    					return ret;
+                    } catch (Exception e) {
+                        throw new RuntimeException("error while defining variable " + (name == null ? "unknown" : "\"" + name.toString() + "\"")+ ": " + e.getMessage() + " " + formatSourceLocation(expr), e);
+                    }
 				}
 				else if (code == sym_and.code) { // (and X ...) short-circuit
 					for (int i = 1; i < expr.size(); i++) {
-						if (!Core.booleanValue(eval(expr.get(i), env))) {
-							return false;
-						}
+					    try {
+    						if (!Core.booleanValue(eval(expr.get(i), env))) {
+    							return false;
+    						}
+					    } catch (Exception e) {
+                            throw new RuntimeException("error in and expression " + expr.get(i) + ": " + e.getMessage() + " " + formatSourceLocation(expr), e);
+                        }
+
 					}
 					return true;
 				}
 				else if (code == sym_or.code) { // (or X ...) short-circuit
 					for (int i = 1; i < expr.size(); i++) {
-						if (Core.booleanValue(eval(expr.get(i), env))) {
-							return true;
-						}
+					    try {
+					        Object v = eval(expr.get(i), env);
+    						if (Core.booleanValue(v)) {
+    							return v;
+    						}
+					    } catch (Exception e) {
+                            throw new RuntimeException("error in or expression " + expr.get(i) + ": " + e.getMessage() + " " + formatSourceLocation(expr), e);
+                        }
+
 					}
-					return false;
+					return null;
 				}
 				else if (code == sym_if.code) { // (if CONDITION THEN_EXPR [ELSE_EXPR])
-					Object cond = expr.get(1);
-					if (Core.booleanValue(eval(cond, env))) {
-						return eval(expr.get(2), env);
+				    boolean cond;
+				    try {
+			            cond = Core.booleanValue(eval(expr.get(1), env));
+                    } catch (Exception e) {
+                        throw new RuntimeException("error in if condition " + expr.get(1) + ": " + e.getMessage() + " " + formatSourceLocation(expr), e);
+                    }
+
+					if (cond) {
+					    try {
+					        return eval(expr.get(2), env);
+	                    } catch (Exception e) {
+	                        throw new RuntimeException("error in then branch " + expr.get(2) + ": " + e.getMessage() + " " + formatSourceLocation(expr), e);
+	                    }
+
 					} else {
-						if (expr.size() <= 3)
-							return null;
-						return eval(expr.get(3), env);
+					    try {
+    						if (expr.size() <= 3)
+    							return null;
+    						return eval(expr.get(3), env);
+	                    } catch (Exception e) {
+	                        throw new RuntimeException("error in else branch " + expr.get(3) + ": " + e.getMessage() + " " + formatSourceLocation(expr), e);
+	                    }
+
 					}
 				}
 				else if (code == sym_quote.code) { // (quote X)
@@ -468,7 +587,7 @@ public final class Core {
 					for (int i = 1; i < expr.size(); i++) {
 						r.add(expr.get(i));
 					}
-					return new UserFn(r, env);
+					return new UserFn(r, this, env);
 				}
 				else if (code == sym_do.code) { // (do X ...)
 					int last = expr.size() - 1;
@@ -545,12 +664,14 @@ public final class Core {
 						
 						try {
 							Method m = cls.getMethod(methodName, parameterTypes);
+							m.setAccessible(true);
 							return m.invoke(obj, parameters.toArray());
 						} catch (NoSuchMethodException e) {
 							for (Method m : cls.getMethods()) {
 								// find a method with the same number of parameters
 								if (m.getName().equals(methodName) && m.getParameterTypes().length == expr.size() - 3) {
 									try {
+									    m.setAccessible(true);
 										return m.invoke(obj, parameters.toArray());
 									} catch (IllegalArgumentException iae) {
 										// try next method
@@ -570,7 +691,7 @@ public final class Core {
 					// (new CLASS ARG ...) ; create new Java object
 					try {
 						String className = expr.get(1).toString();
-						Class<?> cls = getClass(className);
+						Class<?> cls = globalEnv.getClass(className);
 						Class<?>[] parameterTypes = new Class<?>[expr.size() - 2];
 						ArrayList<Object> parameters = new ArrayList<Object>();
 						int last = expr.size() - 1;
@@ -638,7 +759,11 @@ public final class Core {
 					Environment env2 = new Environment(env);
 					List<Object> bindings = Core.listValue(expr.get(1));
 					for (int i = 0; i < bindings.size(); i+= 2) {
-						env2.def(Core.symbolValue(bindings.get(i)).code, eval(bindings.get(i + 1), env2));
+					    try {
+					        env2.def(Core.symbolValue(bindings.get(i)).code, eval(bindings.get(i + 1), env2));
+	                    } catch (Exception e) {
+	                        throw new RuntimeException("error in let declaration of variable " + bindings.get(i) + ": " + e.getMessage() + " " + formatSourceLocation(expr), e);
+	                    }
 					}
 					Object ret = null;
 					for (int i = 2; i < expr.size(); i++) {
@@ -654,21 +779,19 @@ public final class Core {
 						if (x instanceof Symbol) { // e.g. java.util.Date
 							String s = x.toString();
 							try {								
-								lastImport = getClass(s);
-								getClassCache.put(lastImport.getSimpleName(), lastImport);
+								lastImport = globalEnv.getClass(s);
 							} catch (ClassNotFoundException cnfe) {
-								if (!imports.contains(s)) imports.add(s);
+							    env.tryAddImport(s);
 							}
 						} else if (x instanceof List) { // e.g. (java.util Date ArrayList)
 							List<Object> xl = listValue(x);
 							String prefix = xl.get(0).toString();
 							for (int j = 1; j < xl.size(); j++) {
 								String s = xl.get(j).toString();
-								lastImport = getClass(prefix + "." + s);
-								getClassCache.put(s, lastImport);
+								lastImport = globalEnv.getClass(prefix + "." + s);
 							}
 						} else {
-							throw new RuntimeException("Syntax error");
+							throw new RuntimeException("Syntax error " + formatSourceLocation(expr));
 						}
 					}
 					return lastImport;
@@ -694,13 +817,15 @@ public final class Core {
 //					(. frame pack)
 //					(. frame setVisible true)
 
-					Class<?> cls = getClass(expr.get(1).toString());
+					Class<?> cls = globalEnv.getClass(expr.get(1).toString());
 					ClassLoader cl = cls.getClassLoader();
 					HashMap<String, UserFn> methods = new HashMap<String, UserFn>();
 					for (int i = 2; i < expr.size(); i++) {
 						@SuppressWarnings("unchecked")
 						ArrayList<Object> methodDef = (ArrayList<Object>) expr.get(i);
-						methods.put(methodDef.get(0).toString(), new UserFn(new ArrayList<Object>(methodDef.subList(1, methodDef.size())), env));
+						methods.put(
+						        methodDef.get(0).toString(), 
+						        new UserFn(new ArrayList<Object>(methodDef.subList(1, methodDef.size())), this, env));
 					}
 					class MyHandler implements InvocationHandler {
 						HashMap<String, UserFn> methods;
@@ -725,7 +850,11 @@ public final class Core {
 				{
 					ArrayList<Object> args = new ArrayList<Object>();
 					for (int i = 1; i < expr.size(); i++) {
-						args.add(eval(expr.get(i), env));
+					    try {
+					        args.add(eval(expr.get(i), env));
+	                    } catch (Exception e) {
+	                        throw new RuntimeException("error in recur arguments: " + e.getMessage() + " " + formatSourceLocation(expr), e);
+	                    }
 					}
 					throw new Recur(args);
 				}
@@ -736,10 +865,15 @@ public final class Core {
 					ArrayList<Object> formalParams = new ArrayList<Object>();
 					ArrayList<Object> actualParams = new ArrayList<Object>();
 					Environment env2 = new Environment(env);
-					for (int i = 0; i < bindings.size(); i+= 2) {
-						formalParams.add(bindings.get(i));
-						actualParams.add(eval(bindings.get(i + 1), env2));
-					}
+					try {
+    					for (int i = 0; i < bindings.size(); i+= 2) {
+    						formalParams.add(bindings.get(i));
+    						actualParams.add(eval(bindings.get(i + 1), env2));
+    					}
+                    } catch (Exception e) {
+                        throw new RuntimeException("error in loop initialization code: " + e.getMessage() + " " + formatSourceLocation(expr), e);
+                    }
+
 
 					loopStart: while (true) {
 						// fill the environment
@@ -754,7 +888,9 @@ public final class Core {
 							} catch (Recur e) {
 								actualParams = e.args;
 								continue loopStart; // recur this loop (effectively goto)
-							}
+							} catch (Exception e) {
+		                        throw new RuntimeException("error in loop body code: " + e.getMessage() + " " + formatSourceLocation(expr), e);
+		                    }
 						}
 						return ret;
 					}
@@ -781,7 +917,7 @@ public final class Core {
 							Object e = expr.get(i);
 							if (e instanceof ArrayList) {
 								ArrayList<?> exprs = (ArrayList<?>) e;
-								if (exprs.get(0).equals(sym_catch) && getClass(exprs.get(1).toString()).isInstance(t)) {
+								if (exprs.get(0).equals(sym_catch) && globalEnv.getClass(exprs.get(1).toString()).isInstance(t)) {
 									Environment env2 = new Environment(env);
 									env2.def(Symbol.toCode(exprs.get(2).toString()), t);
 									for (int j = 3; j < exprs.size(); j++) {
@@ -807,25 +943,41 @@ public final class Core {
 				}
 				else if (code == sym_defmacro.code) // (defmacro add (a & more) `(+ ~a ~@more)) ; define macro
 				{
-					macros.put(expr.get(1).toString(), new UserFn(new ArrayList<Object>(expr.subList(2, expr.size())), globalEnv));
+					macros.put(
+					        expr.get(1).toString(), 
+					        new UserFn(new ArrayList<Object>(expr.subList(2, expr.size())), this, globalEnv));
 					return null;
+				}
+				else if (code == sym_env.code) {
+				    Environment e = env;
+				    ArrayList<List<String>> ret = new ArrayList<List<String>>();
+				    while (e != null) {
+				        List<String> ss = e.env.keySet().stream().map(Symbol.symname::get).collect(Collectors.toList());
+				        ret.add(ss);
+				        e = e.outer;
+				    }
+				    return ret;
 				}
 			}
 			// evaluate arguments
-			Object func = eval(expr.get(0), env);
-			ArrayList<Object> args = new ArrayList<Object>();
-			int len = expr.size();
-			for (int i = 1; i < len; i++) {
-				args.add(eval(expr.get(i), env));
+			try {
+    			Object func = eval(expr.get(0), env);
+    			ArrayList<Object> args = new ArrayList<Object>();
+    			int len = expr.size();
+    			for (int i = 1; i < len; i++) {
+    				args.add(eval(expr.get(i), env));
+    			}
+    			return apply(func, args);
+			} catch (Exception e) {
+			    throw new Exception("Error in evaluating list: " + e.getMessage() + " " + formatSourceLocation(expr), e);
 			}
-			return apply(func, args);
 		} else {
 			// return n.clone();
 			return n;
 		}
 	}
 
-	private static Object quasiquote(Object arg, Environment env) throws Throwable {
+	private Object quasiquote(Object arg, Environment env) throws Throwable {
 		if (arg instanceof ArrayList && ((ArrayList<?>) arg).size() > 0) {
 			ArrayList<?> arg2 = (ArrayList<?>) arg;
 			Object head = arg2.get(0);
@@ -852,43 +1004,18 @@ public final class Core {
 		}
 	}
 
-	// cached
-	static Class<?> getClass(String className) throws ClassNotFoundException {
-		if (getClassCache.containsKey(className)) {
-			return getClassCache.get(className);
-		} else {
-			try {
-				Class<?> value = Class.forName(className);
-				getClassCache.put(className, value);
-				return value;
-			} catch (ClassNotFoundException cnfe) {
-				for (String prefix : imports) {
-					try {
-						Class<?> value = Class.forName(prefix + "." + className);
-						getClassCache.put(className, value);
-						return value;
-					} catch (ClassNotFoundException e) {
-						// try next import prefix
-						continue;
-					}
-				}
-				throw new ClassNotFoundException(className);
-			}
-		}
-	}
-	
-	static Class<?> tryGetClass(String className) {
+	Class<?> tryGetClass(String className) {
 		try {
-			return getClass(className);
+			return globalEnv.getClass(className);
 		} catch (ClassNotFoundException e) {
 			return null;
 		}
 	}
 
-	public static Object load_string(String s) throws Throwable {
+	public Object load_string(String s, String name) throws Throwable {
 		s = "(" + s + "\n)";
 		Object result = null;
-		for (Object o : Core.listValue(parse(new StringReader(s))))  {
+		for (Object o : Core.listValue(parse(new StringReader(s), new ParseContext(name))))  {
 			result = macroexpandEval(o, globalEnv);
 		}
 		return result;
@@ -899,21 +1026,29 @@ public final class Core {
 	}
 
 	// read-eval-print loop
-	public static void repl() {
-		while (true) {
-			try {
-				prompt();
-				Object expr;
-				try {
-					expr = parse(defaultReader);
-				} catch (EOFException e) {
-					break;
-				}
-				System.out.println(toReadableString(macroexpandEval(expr, globalEnv)));
-			} catch (Throwable e) {
-				e.printStackTrace();
-			}
-		}
+	public void repl() {
+	    try {
+    	    Terminal t = TerminalBuilder.terminal();
+    	    LineReader lr = LineReaderBuilder.builder().terminal(t).build();
+    		while (true) {
+    			try {
+    				//prompt();
+    			    String line = lr.readLine("> ");
+    				Object expr;
+    				try {
+//    					expr = parse(defaultReader);
+                        expr = parse(new StringReader(line), new ParseContext("<repl>"));
+    				} catch (EOFException e) {
+    					break;
+    				}
+    				System.out.println(toReadableString(macroexpandEval(expr, globalEnv)));
+    			} catch (Throwable e) {
+    				e.printStackTrace();
+    			}
+    		}
+	    } catch (IOException e) {
+	        throw new RuntimeException(e);
+	    }
 	}
 
 	// extracts characters from URL or filename
@@ -927,14 +1062,7 @@ public final class Core {
 			is = new FileInputStream(urlOrFileName);
 		}
 		BufferedReader br = new BufferedReader(new InputStreamReader(is, Charset.forName(charsetName)));
-		StringBuilder sb = new StringBuilder();
-		while (true) {
-			int c = br.read();
-			if (c < 0) break;
-			sb.append((char) c);
-		}
-		br.close();
-		return sb.toString();
+		return br.lines().collect(Collectors.joining("\n"));
 	}
 
 	// Opposite of slurp. Writes str to filename.
@@ -951,21 +1079,22 @@ public final class Core {
 	}
 
 	// for embedding
-	public static Object get(String s) throws Exception {
+	public Object get(String s) throws Exception {
 		return globalEnv.get(Symbol.toCode(s));
 	}
 
 	// for embedding
-	public static Object set(String s, Object o) {
+	public Object set(String s, Object o) {
 		return globalEnv.def(Symbol.toCode(s), o);
 	}
 
 	public static void main(String[] args) throws Throwable {
+	    Core ctx = new Core(new InputStreamReader(System.in), DEFAULTS);
 		if (args.length == 0) {
 			List<String> argsList = new ArrayList<String>();
-			set("*command-line-args*", argsList);
-			printLogo();
-			repl();
+			ctx.set("*command-line-args*", argsList);
+			ctx.printLogo();
+			ctx.repl();
 			System.out.println();
 			return;
 		} else if (args.length >= 1) {
@@ -983,9 +1112,9 @@ public final class Core {
 			} else if (args[0].equals("-r")) {
 				List<String> argsList = new ArrayList<String>();
 				for (int i = 1; i < args.length; i++) argsList.add(args[i]);
-				set("*command-line-args*", argsList);
-				printLogo();
-				repl();
+				ctx.set("*command-line-args*", argsList);
+				ctx.printLogo();
+				ctx.repl();
 				System.out.println();
 				return;
 			} else if (args[0].equals("-v")) {
@@ -997,20 +1126,24 @@ public final class Core {
 		// execute the file
 		List<String> argsList = new ArrayList<String>();
 		for (int i = 1; i < args.length; i++) argsList.add(args[i]);
-		set("*command-line-args*", argsList);
+		ctx.set("*command-line-args*", argsList);
 		try {			
-			load_file(args[0]);
+			ctx.load_file(args[0]);
 		} catch (IOException e) {
 			e.printStackTrace();
 		}
 	}
 
-	public static Object load_file(String file) throws IOException, Throwable {
-		return load_string(Core.slurp(file, "UTF-8"));
+	public Object load_file(String file) throws IOException, Throwable {
+		return load_string(Core.slurp(file, "UTF-8"), file);
 	}
 
-	public static Object macroexpandEval(Object object, Environment env) throws Throwable {
+	public Object macroexpandEval(Object object, Environment env) throws Throwable {
 		return eval(macroexpand(object), env);
+	}
+	
+	public Object execute(String command) throws Throwable {
+	    return macroexpandEval(parse(new StringReader(command), new ParseContext("<command>")), globalEnv);
 	}
 
 	public static char peek(Reader r) throws IOException {
@@ -1027,10 +1160,16 @@ public final class Core {
 		return i < 0;
 	}
 
-	public static String readToken(Reader r) throws IOException {
+	private static int read(Reader r, ParseContext parseContext) throws IOException {
+	    int c = r.read();
+	    if (c == '\n')
+	        parseContext.nextLine();
+	    return c;
+	}
+	public static String readToken(Reader r, ParseContext parseContext) throws IOException {
 		final String ws = " \t\r\n,";
-		final String delim = "()[] \t\r\n,;\"";
-		final String prefix = "()[]'`\"#";
+		final String delim = "()[]{} \t\r\n,;\"";
+		final String prefix = "()[]{}'`\"#";
 
 		while (true) {			
 			char c, p;
@@ -1040,27 +1179,27 @@ public final class Core {
 				if (eof(r)) throw new EOFException("EOF while reading");
 				p = peek(r);
 				if (ws.indexOf(p) < 0) break;
-				r.read();
+				read(r, parseContext);
 			}
 
 			p = peek(r);
 			if (prefix.indexOf(p) >= 0) { // prefix
 				StringBuilder acc = new StringBuilder(); // accumulator
 				if (p == '#') {
-					r.read();
+					read(r, parseContext);
 					acc.append(p);
 					p = peek(r);
 				}
 				if (p == '"') { // string
-					r.read();
-					acc.append(p);					
+				    read(r, parseContext);
+                    acc.append(p);					
 					while (!eof(r)) {
-						c = (char) r.read();
-						if (c == '"') {
+						c = (char) read(r, parseContext);
+	                    if (c == '"') {
 							break;
 						}
 						if (c == '\\') { // escape
-							char next = (char) r.read();
+							char next = (char) read(r, parseContext);
 							if (next == 'r')
 								next = '\r';
 							else if (next == 'n')
@@ -1082,21 +1221,21 @@ public final class Core {
 					}
 					return acc.toString();
 				} else {				
-					c = (char) r.read();
+					c = (char) read(r, parseContext);
 					return "" + c;
 				}
 			} else if (p == '~') { // unquote
 				StringBuilder acc = new StringBuilder(); // accumulator
-				c = (char) r.read();
-				acc.append(c);
+				c = (char) read(r, parseContext);
+                acc.append(c);
 				if (peek(r) == '@') { // unquote-splicing
-					c = (char) r.read();
-					acc.append(c);
+					c = (char) read(r, parseContext);
+                    acc.append(c);
 				}
 				return acc.toString();
 			} else if (p == ';') { // end-of-line comment
 				while (!eof(r) && peek(r) != '\n') {
-					r.read();
+				    read(r, parseContext);
 				}
 				continue;
 			} else { // other
@@ -1105,20 +1244,20 @@ public final class Core {
 				while (!eof(r)) {
 					p = peek(r);
 					if (delim.indexOf(p) >= 0) break;
-					c = (char) r.read();
-					acc.append(c);
+					c = (char) read(r, parseContext);
+                    acc.append(c);
 				}
 				return acc.toString();
 			}
 		}
 	}
 
-	public static Object parse(Reader r) throws IOException {
-		return parse(r, readToken(r));
+	public Object parse(Reader r, ParseContext parseContext) throws IOException {
+		return parse(r, readToken(r, parseContext), parseContext);
 	}
 
 	// tok is provided if already read
-	public static Object parse(Reader r, String tok) throws IOException {
+	public Object parse(Reader r, String tok, ParseContext parseContext) throws IOException {
 		if (tok.charAt(0) == '"') { // double-quoted string
 			return tok.substring(1);
 		} else if (tok.charAt(0) == '#' && tok.charAt(1) == '"') { // regex
@@ -1126,27 +1265,29 @@ public final class Core {
 		} else if (tok.equals("'")) { // quote
 			ArrayList<Object> ret = new ArrayList<Object>();
 			ret.add(sym_quote);
-			ret.add(parse(r));
+			ret.add(parse(r, parseContext));
 			return ret;
 		} else if (tok.equals("`")) { // quasiquote
 			ArrayList<Object> ret = new ArrayList<Object>();
 			ret.add(sym_quasiquote);
-			ret.add(parse(r));
+			ret.add(parse(r, parseContext));
 			return ret;
 		} else if (tok.equals("~")) { // unquote
 			ArrayList<Object> ret = new ArrayList<Object>();
 			ret.add(sym_unquote);
-			ret.add(parse(r));
+			ret.add(parse(r, parseContext));
 			return ret;
 		} else if (tok.equals("~@")) { // unquote-splicing
 			ArrayList<Object> ret = new ArrayList<Object>();
 			ret.add(sym_unquote_splicing);
-			ret.add(parse(r));
+			ret.add(parse(r, parseContext));
 			return ret;
 		} else if (tok.equals("(")) { // list
-			return parseList(r);
+			return parseList(r, parseContext);
 		} else if (tok.equals("[")) {
-			return parseVector(r);
+			return parseVector(r, parseContext);
+		} else if (tok.equals("{")) {
+		    return parseMap(r, parseContext);
 		} else if (tok.charAt(0) == '\\') { // char
 			// Characters - preceded by a backslash: \c. \newline, \space, \tab, \formfeed, \backspace, and \return yield the corresponding characters. Unicode characters are represented with \\uNNNN as in Java. Octals are represented with \\oNNN.
 			if (tok.length() == 2) {
@@ -1167,7 +1308,7 @@ public final class Core {
 						int codePoint = Integer.parseInt(tok.substring(2), 8);
 						return Character.toChars(codePoint)[0];
 					}
-					throw new RuntimeException("Unsupported character: " + tok);
+					throw new RuntimeException("Unsupported character: " + tok + " in " + parseContext.filename + " line " + parseContext.line);
 				}
 			}
 		} else if (Character.isDigit(tok.charAt(0)) || tok.charAt(0) == '-' && tok.length() >= 2
@@ -1198,31 +1339,55 @@ public final class Core {
 		}
 	}
 
-	private static ArrayList<Object> parseList(Reader r) throws IOException {
+	private ArrayList<Object> parseList(Reader r, ParseContext parseContext) throws IOException {
 		ArrayList<Object> ret = new ArrayList<Object>();
 		while (!eof(r)) {
-			String tok = readToken(r);
+			String tok = readToken(r, parseContext);
 			if (tok.equals(")")) { // end of list
 				break;
 			} else {
-				Object o = parse(r, tok);
+				Object o = parse(r, tok, parseContext);
 				ret.add(o);
 			}
 		}
+		meta.put(ret, new Meta().sourceFile(parseContext.filename).sourceLine(parseContext.line));
 		return ret;
 	}
 	
-	private static Vector<Object> parseVector(Reader r) throws IOException {
+	private Vector<Object> parseVector(Reader r, ParseContext parseContext) throws IOException {
 		Vector<Object> ret = new Vector<Object>();
 		while (!eof(r)) {
-			String tok = readToken(r);
+			String tok = readToken(r, parseContext);
 			if (tok.equals("]")) { // end of list
 				break;
 			} else {
-				Object o = parse(r, tok);
+				Object o = parse(r, tok, parseContext);
 				ret.add(o);
 			}
 		}
 		return ret;
 	}	
+
+   private Map<Object, Object> parseMap(Reader r, ParseContext parseContext) throws IOException {
+        Map<Object, Object> ret = new HashMap<Object, Object>();
+        while (!eof(r)) {
+            String tok = readToken(r, parseContext);
+            if (tok.equals("}")) { // end of list
+                break;
+            } else {
+                Object key = parse(r, tok, parseContext);
+                Object value = parse(r, readToken(r, parseContext), parseContext);
+                ret.put(key, value);
+            }
+        }
+        return ret;
+    }
+
+    public Optional<Meta> getMeta(Object value) {
+        return Optional.ofNullable(meta.get(value));
+    }
+    
+	public Core clone() {
+	    return new Core(defaultReader, globalEnv.clone(), new HashMap<>(macros));
+	}
 }

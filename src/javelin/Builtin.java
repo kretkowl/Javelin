@@ -3,7 +3,6 @@ package javelin;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
-import java.io.Reader;
 import java.io.StringReader;
 import java.util.ArrayList;
 import java.util.Iterator;
@@ -274,24 +273,10 @@ class Builtin {
 		}
 	}
 
-	static class read_string extends Fn {
-		@Override
-		public Object invoke(List<Object> args) throws Throwable {
-			return Core.parse(new StringReader((String) args.get(0)));
-		}
-	}
-
 	static class type extends Fn {
 		@Override
 		public Object invoke(List<Object> args) throws Throwable {
 			return Core.type(args.get(0));
-		}
-	}
-
-	static class eval extends Fn {
-		@Override
-		public Object invoke(List<Object> args) throws Throwable {
-			return Core.macroexpandEval(args.get(0), Core.globalEnv);
 		}
 	}
 
@@ -451,7 +436,7 @@ class Builtin {
 		public Object invoke(List<Object> args) throws Throwable {
 			StringBuilder sb = new StringBuilder();
 			for (Object x : args) {
-				if (x != null) sb.append(x.toString());
+				if (x != null) sb.append(Core.toReadableString(x));
 			}
 			return sb.toString();
 		}
@@ -464,37 +449,6 @@ class Builtin {
 		}
 	}
 
-	// (macroexpand X)
-	static class macroexpand extends Fn {
-		@Override
-		public Object invoke(List<Object> args) throws Throwable {
-			return Core.macroexpand(args.get(0));
-		}
-	}
-
-	// (read [Reader])
-	static class read extends Fn {
-		@Override
-		public Object invoke(List<Object> args) throws Throwable {
-			switch (args.size()) {
-			case 0: return Core.parse(Core.defaultReader);
-			case 1: return Core.parse((Reader) args.get(0));
-			default: throw new IllegalArgumentException();
-			}
-		}
-	}
-	
-	// (load-string STRING)
-	static class load_string extends Fn {
-		@Override
-		public Object invoke(List<Object> args) throws Throwable {
-			switch (args.size()) {			
-			case 1: return Core.load_string((String) args.get(0));
-			default: throw new IllegalArgumentException();
-			}
-		}
-	}
-	
 	// (nth COLL INDEX)
 	static class nth extends Fn {
 		@Override

@@ -4,10 +4,12 @@ import java.util.ArrayList;
 import java.util.List;
 
 class UserFn extends Fn { // anonymous function
+    Core context;
 	List<Object> def; // definition
 	Environment outer_env;
 
-	UserFn(List<Object> def, Environment outer_env) {
+	UserFn(List<Object> def, Core context, Environment outer_env) {
+	    this.context = context;
 		this.def = def;
 		this.outer_env = outer_env;
 	}
@@ -21,6 +23,7 @@ class UserFn extends Fn { // anonymous function
 
 	@Override
 	public Object invoke(List<Object> args) throws Throwable {
+	    context.getMeta(this).map(Meta::name).ifPresent(s -> System.out.println("calling " + s));
 		// anonymous function application. lexical scoping
 		// ((ARGUMENT ...) BODY ...)
 		fnStart: while (true) {
@@ -44,7 +47,7 @@ class UserFn extends Fn { // anonymous function
 			Object ret = null;
 			for (int i = 1; i < len; i++) { // body
 				try {
-					ret = Core.eval(this.def.get(i), local_env);
+					ret = context.eval(this.def.get(i), local_env);
 				} catch (Recur e) {
 					args = e.args;
 					continue fnStart; // recur this function (effectively goto)
