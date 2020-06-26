@@ -4,6 +4,15 @@
 # netbeans ignore personal stuff 
 nbproject/private/
 
+# intellij
+*.iml
+/idea/
+
+# eclipse
+.classpath
+.project
+/.settings/
+
 ## generic files to ignore
 *~
 *.lock
@@ -12,3 +21,4 @@ nbproject/private/
 *.out
 /bin/
 *.jar
+/target/
